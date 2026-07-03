@@ -1,19 +1,43 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=77.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "kademlia-dynamic"
-version = "1.0.0"
+version = "1.1.0"
 description = "Lightweight, async-first Kademlia DHT, with dynamic distance-based cache TTL and switchable JSON/Bencode wire serialization"
 readme = "README.md"
 requires-python = ">=3.8"
 dependencies = []
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE.md"]
 authors = [{ name = "f4rsantos", email = "f4rsantos@gmail.com" }]
+keywords = ["kademlia", "dht", "p2p", "distributed-hash-table", "asyncio", "peer-to-peer"]
+classifiers = [
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Framework :: AsyncIO",
+    "Topic :: System :: Networking",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio"]
 
 [project.urls]
 Repository = "https://github.com/f4rsantos/kademlia_dynamic"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
 
 [tool.setuptools]
 packages = ["kademlia_dynamic"]

@@ -48,8 +48,13 @@ asyncio.run(main())
 **Main DHT node class**
 
 ```python
-KademliaServer(serialization: str = "json")  # or "bencode"
+KademliaServer(serialization: str = "json", verify_response_source: bool = True)
 ```
+
+- `serialization` — `"json"` (default) or `"bencode"` wire format
+- `verify_response_source` — when `True` (default), responses are only accepted from the IP:port the query was sent to; forged responses from other sources are dropped. Set to `False` if peers legitimately reply from a different address (e.g. some NAT setups).
+
+Additional keyword-only tuning arguments (`k`, `alpha`, `query_timeout`, ...) are listed under [Configuration](#configuration).
 
 #### Methods
 
@@ -77,7 +82,9 @@ Peer.from_dict(data)  # Deserialize
 - `hash_key_to_node_id(key: str) -> str` — Hash key to node ID space
 - `xor_distance(hex_id_a: str, hex_id_b: str) -> int` — Compute XOR distance
 
-## Comparison to Canonical Kademlia (BEP 20)
+## Comparison to Canonical Kademlia
+
+Canonical references: the Kademlia paper (Maymounkov & Mazières, 2002) and BEP 5 (the BitTorrent DHT protocol).
 
 ### Similarities
 
@@ -89,9 +96,9 @@ Peer.from_dict(data)  # Deserialize
 - Periodic bucket refresh, value republishing, expiry cleanup
 - Asynchronous UDP protocol
 
-### Differences vs BEP 20 reference
+### Differences vs canonical Kademlia / BEP 5
 
-| Feature                         | This Implementation                | BEP 20 Kademlia                     |
+| Feature                         | This Implementation                | Canonical Kademlia / BEP 5          |
 | ------------------------------- | ---------------------------------- | ----------------------------------- |
 | **Language**                    | Python                             | (Language-agnostic spec)            |
 | **Async Model**                 | asyncio                            | Blocking (implementation-dependent) |
@@ -104,25 +111,34 @@ Peer.from_dict(data)  # Deserialize
 
 ### Behavioral Notes
 
-- **Node Discovery:** Includes implicit peer discovery via sender fields in all responses (not explicit in BEP 20)
+- **Node Discovery:** Includes implicit peer discovery via sender fields in all responses (not explicit in BEP 5)
 - **Cache TTL:** Cached values expire faster (shorter TTL) for distant nodes, reducing stale caches
 - **Bucket Refresh:** Proactive refresh every 3600s (1h) of buckets that haven't seen activity
 - **Value Expiry:** Original publishers republish every 24h; non-publishers every 1h
 
 ## Configuration
 
-Edit module-level constants in `kademlia_dynamic/kademlia.py`:
+All tunables are per-server constructor arguments (keyword-only). The module-level constants in `kademlia_dynamic/kademlia.py` are only their defaults.
 
 ```python
-K_BUCKET_SIZE = 20                              # Peers per bucket
-ALPHA_CONCURRENCY = 3                           # Parallel queries
-QUERY_TIMEOUT_SECONDS = 2.0                     # RPC timeout
-BUCKET_REFRESH_INTERVAL = 3600                  # Refresh stale buckets (s)
-KEY_EXPIRY_SECONDS = 86410                      # Value TTL (24h + 10s)
-NON_PUBLISHER_RESTORE_INTERVAL = 3600           # Cache restore interval (1h)
-ORIGINAL_PUBLISHER_REPUBLISH_INTERVAL = 86400   # Publisher republish (24h)
-MIN_CACHE_TTL_SECONDS = 600                     # Minimum cached value TTL (10m)
+server = KademliaServer(
+    serialization="json",                          # or "bencode"
+    verify_response_source=True,                   # drop responses from unexpected addresses
+    k=20,                                          # peers per bucket (K_BUCKET_SIZE)
+    alpha=3,                                       # parallel queries (ALPHA_CONCURRENCY)
+    query_timeout=2.0,                             # RPC timeout, seconds
+    bucket_refresh_interval=3600,                  # refresh stale buckets + expiry sweep (s)
+    key_expiry_seconds=86410,                      # value TTL (24h + 10s)
+    non_publisher_restore_interval=3600,           # cache restore interval (1h)
+    original_publisher_republish_interval=86400,   # publisher republish (24h)
+    min_cache_ttl_seconds=600,                     # minimum cached value TTL (10m)
+    max_dispatch_tasks=64,                         # backpressure: max concurrent inbound handlers
+)
 ```
+
+The bind address is chosen per node via `listen(port, ip=...)`. Node ID width (160-bit) is fixed — it is tied to SHA1.
+
+All nodes in a network should use the same `k` and `alpha` for predictable lookup behavior, and must use the same serialization.
 
 ## Design Notes
 
@@ -132,10 +148,12 @@ Both are built in, pure Python, zero dependencies. Pick per-server via the `seri
 
 ```python
 KademliaServer(serialization="json")      # default: human-readable, easy to debug
-KademliaServer(serialization="bencode")   # BEP 20-compatible wire format
+KademliaServer(serialization="bencode")   # BitTorrent-style bencode wire format
 ```
 
 All peers in a network must use the same serialization to interoperate. `None` values are omitted from encoded messages in both formats (bencode has no null type); readers treat a missing key as `None`.
+
+One bencode edge case: a `str` value that begins with the internal byte marker `\x00bytes\x00` will round-trip back as `bytes`. Avoid leading NUL bytes in string values (or use the JSON codec, which does not have this ambiguity).
 
 ### Values: str or bytes
 
@@ -151,4 +169,4 @@ Not thread-safe. Designed for single-threaded asyncio use. For multi-threaded ac
 
 ### Backpressure
 
-Datagram dispatch queue limits to 64 concurrent tasks. Excess packets are dropped with a warning log.
+Datagram dispatch queue limits concurrent inbound handler tasks (`max_dispatch_tasks`, default 64). Excess packets are dropped with a warning log.

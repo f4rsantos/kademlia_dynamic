@@ -49,10 +49,15 @@ def node_id_to_binary(node_id: str) -> str:
     return bin(int(node_id, 16))[2:].zfill(NODE_ID_BITS)
 
 
-def compute_cache_ttl(own_node_id: str, target_id: str) -> float:
+def compute_cache_ttl(
+    own_node_id: str,
+    target_id: str,
+    key_expiry_seconds: float = KEY_EXPIRY_SECONDS,
+    min_cache_ttl_seconds: float = MIN_CACHE_TTL_SECONDS,
+) -> float:
     distance = xor_distance(own_node_id, target_id)
-    ttl = KEY_EXPIRY_SECONDS // (distance.bit_length() + 1)
-    return max(MIN_CACHE_TTL_SECONDS, ttl)
+    ttl = key_expiry_seconds // (distance.bit_length() + 1)
+    return max(min_cache_ttl_seconds, ttl)
 
 
 class Peer:
@@ -77,8 +82,9 @@ class Peer:
 
 
 class KBucket:
-    def __init__(self, prefix: str = ""):
+    def __init__(self, prefix: str = "", k: int = K_BUCKET_SIZE):
         self.prefix = prefix
+        self.k = k
         self.peers: List[Peer] = []
         self.replacement_cache: List[Peer] = []
 
@@ -99,7 +105,7 @@ class KBucket:
         return False
 
     def has_capacity(self) -> bool:
-        return len(self.peers) < K_BUCKET_SIZE
+        return len(self.peers) < self.k
 
     def add_new(self, peer: Peer):
         self.peers.append(peer)
@@ -107,12 +113,6 @@ class KBucket:
     def add_to_replacement_cache(self, peer: Peer):
         if not any(p.node_id == peer.node_id for p in self.replacement_cache):
             self.replacement_cache.append(peer)
-
-    def evict_oldest_and_promote(self):
-        if self.peers:
-            self.peers.pop(0)
-        if self.replacement_cache:
-            self.peers.append(self.replacement_cache.pop(0))
 
     def oldest(self) -> Optional[Peer]:
         return self.peers[0] if self.peers else None
@@ -122,9 +122,12 @@ class KBucket:
 
 
 class RoutingTable:
-    def __init__(self, own_node_id: str):
+    def __init__(self, own_node_id: str, k: int = K_BUCKET_SIZE,
+                 refresh_interval: float = BUCKET_REFRESH_INTERVAL):
         self.own_node_id = own_node_id
-        self._buckets: List[KBucket] = [KBucket(prefix="")]
+        self.k = k
+        self.refresh_interval = refresh_interval
+        self._buckets: List[KBucket] = [KBucket(prefix="", k=k)]
 
     def _bucket_for(self, node_id: str) -> KBucket:
         binary = node_id_to_binary(node_id)
@@ -138,8 +141,8 @@ class RoutingTable:
         return own_binary.startswith(bucket.prefix)
 
     def _split_bucket(self, bucket: KBucket):
-        prefix_zero = KBucket(prefix=bucket.prefix + "0")
-        prefix_one = KBucket(prefix=bucket.prefix + "1")
+        prefix_zero = KBucket(prefix=bucket.prefix + "0", k=bucket.k)
+        prefix_one = KBucket(prefix=bucket.prefix + "1", k=bucket.k)
         for peer in bucket.peers:
             binary = node_id_to_binary(peer.node_id)
             if binary.startswith(prefix_zero.prefix):
@@ -175,7 +178,9 @@ class RoutingTable:
         if bucket.replacement_cache:
             bucket.peers.append(bucket.replacement_cache.pop(0))
 
-    def find_nearest(self, target_id: str, count: int = K_BUCKET_SIZE) -> List[Peer]:
+    def find_nearest(self, target_id: str, count: Optional[int] = None) -> List[Peer]:
+        if count is None:
+            count = self.k
         all_peers = [p for bucket in self._buckets for p in bucket.get_peers()]
         all_peers.sort(key=lambda p: xor_distance(p.node_id, target_id))
         return all_peers[:count]
@@ -187,7 +192,7 @@ class RoutingTable:
         return [p for bucket in self._buckets for p in bucket.get_peers()]
 
     def stale_buckets(self) -> List[KBucket]:
-        cutoff = time.time() - BUCKET_REFRESH_INTERVAL
+        cutoff = time.time() - self.refresh_interval
         return [b for b in self._buckets if b.peers and b.peers[-1].last_seen < cutoff]
 
 
@@ -201,8 +206,9 @@ class KademliaProtocol(asyncio.DatagramProtocol):
         self.transport = transport
 
     def datagram_received(self, data, addr):
-        if self._active_dispatch_tasks >= _MAX_DISPATCH_TASKS:
-            logger.warning(f"[kad] dispatch queue full ({_MAX_DISPATCH_TASKS}), dropping packet from {addr}")
+        limit = self.server.max_dispatch_tasks
+        if self._active_dispatch_tasks >= limit:
+            logger.warning(f"[kad] dispatch queue full ({limit}), dropping packet from {addr}")
             return
         self._active_dispatch_tasks += 1
         task = asyncio.create_task(self._dispatch(data, addr))
@@ -232,7 +238,7 @@ class KademliaProtocol(asyncio.DatagramProtocol):
 
     async def _handle_pong(self, msg, addr):
         self._register_sender(msg, addr)
-        self.server.deliver_response(msg["id"], msg)
+        self.server.deliver_response(msg["id"], msg, addr)
 
     async def _handle_find_node(self, msg, addr):
         self._register_sender(msg, addr)
@@ -245,7 +251,7 @@ class KademliaProtocol(asyncio.DatagramProtocol):
         }, addr)
 
     async def _handle_find_node_res(self, msg, addr):
-        self.server.deliver_response(msg["id"], msg)
+        self.server.deliver_response(msg["id"], msg, addr)
 
     async def _handle_set(self, msg, addr):
         self._register_sender(msg, addr)
@@ -253,7 +259,7 @@ class KademliaProtocol(asyncio.DatagramProtocol):
         self._send_to({"type": "set_res", "sender": self.server.own_peer.to_dict(), "id": msg["id"]}, addr)
 
     async def _handle_set_res(self, msg, addr):
-        self.server.deliver_response(msg["id"], msg)
+        self.server.deliver_response(msg["id"], msg, addr)
 
     async def _handle_set_cached(self, msg, addr):
         self._register_sender(msg, addr)
@@ -261,7 +267,7 @@ class KademliaProtocol(asyncio.DatagramProtocol):
         self._send_to({"type": "set_cached_res", "sender": self.server.own_peer.to_dict(), "id": msg["id"]}, addr)
 
     async def _handle_set_cached_res(self, msg, addr):
-        self.server.deliver_response(msg["id"], msg)
+        self.server.deliver_response(msg["id"], msg, addr)
 
     async def _handle_check_store(self, msg, addr):
         self._register_sender(msg, addr)
@@ -276,20 +282,7 @@ class KademliaProtocol(asyncio.DatagramProtocol):
         }, addr)
 
     async def _handle_check_store_res(self, msg, addr):
-        self.server.deliver_response(msg["id"], msg)
-
-    async def _handle_get(self, msg, addr):
-        self._register_sender(msg, addr)
-        entry = self.server.data_store.get(msg["key"])
-        self._send_to({
-            "type": "get_res",
-            "sender": self.server.own_peer.to_dict(),
-            "id": msg["id"],
-            "value": entry.value if entry and not entry.is_expired() else None,
-        }, addr)
-
-    async def _handle_get_res(self, msg, addr):
-        self.server.deliver_response(msg["id"], msg)
+        self.server.deliver_response(msg["id"], msg, addr)
 
     async def _handle_find_value(self, msg, addr):
         self._register_sender(msg, addr)
@@ -312,7 +305,7 @@ class KademliaProtocol(asyncio.DatagramProtocol):
             }, addr)
 
     async def _handle_find_value_res(self, msg, addr):
-        self.server.deliver_response(msg["id"], msg)
+        self.server.deliver_response(msg["id"], msg, addr)
 
 
 def json_encode(payload: dict) -> bytes:
@@ -431,8 +424,9 @@ class StoredValue:
     def is_expired(self) -> bool:
         return time.time() > self.expires_at
 
-    def needs_republish(self) -> bool:
-        interval = ORIGINAL_PUBLISHER_REPUBLISH_INTERVAL if self.is_original_publisher else NON_PUBLISHER_RESTORE_INTERVAL
+    def needs_republish(self, interval: Optional[float] = None) -> bool:
+        if interval is None:
+            interval = ORIGINAL_PUBLISHER_REPUBLISH_INTERVAL if self.is_original_publisher else NON_PUBLISHER_RESTORE_INTERVAL
         return time.time() - self.last_republished_at >= interval
 
     def mark_republished(self):
@@ -446,18 +440,42 @@ SERIALIZATION_CODECS = {
 
 
 class KademliaServer:
-    def __init__(self, serialization: str = "json"):
+    def __init__(
+        self,
+        serialization: str = "json",
+        verify_response_source: bool = True,
+        *,
+        k: int = K_BUCKET_SIZE,
+        alpha: int = ALPHA_CONCURRENCY,
+        query_timeout: float = QUERY_TIMEOUT_SECONDS,
+        bucket_refresh_interval: float = BUCKET_REFRESH_INTERVAL,
+        key_expiry_seconds: float = KEY_EXPIRY_SECONDS,
+        non_publisher_restore_interval: float = NON_PUBLISHER_RESTORE_INTERVAL,
+        original_publisher_republish_interval: float = ORIGINAL_PUBLISHER_REPUBLISH_INTERVAL,
+        min_cache_ttl_seconds: float = MIN_CACHE_TTL_SECONDS,
+        max_dispatch_tasks: int = _MAX_DISPATCH_TASKS,
+    ):
         if serialization not in SERIALIZATION_CODECS:
             raise ValueError(f"unknown serialization: {serialization!r}, expected one of {list(SERIALIZATION_CODECS)}")
         self.serialization = serialization
         self.encode, self.decode = SERIALIZATION_CODECS[serialization]
+        self.verify_response_source = verify_response_source
+        self.k = k
+        self.alpha = alpha
+        self.query_timeout = query_timeout
+        self.bucket_refresh_interval = bucket_refresh_interval
+        self.key_expiry_seconds = key_expiry_seconds
+        self.non_publisher_restore_interval = non_publisher_restore_interval
+        self.original_publisher_republish_interval = original_publisher_republish_interval
+        self.min_cache_ttl_seconds = min_cache_ttl_seconds
+        self.max_dispatch_tasks = max_dispatch_tasks
 
         self.data_store: Dict[str, StoredValue] = {}
-        self.pending_queries: Dict[str, asyncio.Future] = {}
+        self.pending_queries: Dict[str, Tuple[asyncio.Future, Optional[Tuple[str, int]]]] = {}
 
         node_id = generate_node_id()
         self.own_peer = Peer(node_id, "0.0.0.0", 0)
-        self.routing_table = RoutingTable(node_id)
+        self.routing_table = RoutingTable(node_id, k=k, refresh_interval=bucket_refresh_interval)
         self.protocol: Optional[KademliaProtocol] = None
         self._refresh_task: Optional[asyncio.Task] = None
         self._republish_task: Optional[asyncio.Task] = None
@@ -485,10 +503,10 @@ class KademliaServer:
             query_id = generate_query_id()
             query = {"type": "ping", "id": query_id, "sender": self.own_peer.to_dict()}
             future = asyncio.get_running_loop().create_future()
-            self.pending_queries[query_id] = future
+            self.pending_queries[query_id] = (future, (ip, port))
             try:
                 self.protocol.transport.sendto(self.encode(query), (ip, port))
-                res = await asyncio.wait_for(future, timeout=QUERY_TIMEOUT_SECONDS)
+                res = await asyncio.wait_for(future, timeout=self.query_timeout)
                 if res:
                     real_peer = Peer.from_dict(res["sender"])
                     real_peer.ip = ip
@@ -528,11 +546,13 @@ class KademliaServer:
                 return
             alive = await self.ping(oldest)
             if not alive and bucket.oldest() is oldest:
-                bucket.evict_oldest_and_promote()
-                bucket.add_new(peer)
+                bucket.peers = [p for p in bucket.peers if p.node_id != oldest.node_id]
+                bucket.replacement_cache = [p for p in bucket.replacement_cache if p.node_id != peer.node_id]
+                if not bucket.contains(peer.node_id):
+                    bucket.add_new(peer)
 
     async def find_node(self, target_id: str) -> List[Peer]:
-        closest = self.routing_table.find_nearest(target_id, K_BUCKET_SIZE)
+        closest = self.routing_table.find_nearest(target_id)
         if not closest:
             return []
 
@@ -540,7 +560,7 @@ class KademliaServer:
         queried_ids: set = set()
         in_flight: Dict[asyncio.Task, Peer] = {}
 
-        async def process_response(peer: Peer, res: Optional[dict]):
+        async def process_response(res: Optional[dict]):
             if res and "peers" in res:
                 for peer_dict in res["peers"]:
                     candidate = Peer.from_dict(peer_dict)
@@ -549,10 +569,10 @@ class KademliaServer:
                         await self.try_add_peer(candidate)
 
         while True:
-            closest = self.routing_table.find_nearest(target_id, K_BUCKET_SIZE)
+            closest = self.routing_table.find_nearest(target_id)
             unqueried = [p for p in closest if p.node_id not in queried_ids]
 
-            while len(in_flight) < ALPHA_CONCURRENCY and unqueried:
+            while len(in_flight) < self.alpha and unqueried:
                 peer = unqueried.pop(0)
                 queried_ids.add(peer.node_id)
                 task = asyncio.create_task(self._send_query(peer, {"type": "find_node", "target": target_id}))
@@ -563,22 +583,20 @@ class KademliaServer:
 
             done, _ = await asyncio.wait(in_flight.keys(), return_when=asyncio.FIRST_COMPLETED)
             for task in done:
-                peer = in_flight.pop(task)
-                await process_response(peer, task.result())
+                in_flight.pop(task)
+                await process_response(task.result())
 
-            closest = self.routing_table.find_nearest(target_id, K_BUCKET_SIZE)
+            closest = self.routing_table.find_nearest(target_id)
             all_queried = {p.node_id for p in closest}.issubset(queried_ids | {self.own_peer.node_id})
             nothing_in_flight = not in_flight
             if all_queried and nothing_in_flight:
                 break
 
-        for task in in_flight:
-            task.cancel()
-        return self.routing_table.find_nearest(target_id, K_BUCKET_SIZE)
+        return self.routing_table.find_nearest(target_id)
 
     async def find_value(self, key: str) -> Tuple[Optional[Value], List[Peer]]:
         target_id = hash_key_to_node_id(key)
-        closest = self.routing_table.find_nearest(target_id, K_BUCKET_SIZE)
+        closest = self.routing_table.find_nearest(target_id)
         if not closest:
             return None, []
 
@@ -588,10 +606,10 @@ class KademliaServer:
         in_flight: Dict[asyncio.Task, Peer] = {}
 
         while True:
-            closest = self.routing_table.find_nearest(target_id, K_BUCKET_SIZE)
+            closest = self.routing_table.find_nearest(target_id)
             unqueried = [p for p in closest if p.node_id not in queried_ids]
 
-            while len(in_flight) < ALPHA_CONCURRENCY and unqueried:
+            while len(in_flight) < self.alpha and unqueried:
                 peer = unqueried.pop(0)
                 queried_ids.add(peer.node_id)
                 queried_peers[peer.node_id] = peer
@@ -621,7 +639,7 @@ class KademliaServer:
                             seen_ids.add(candidate.node_id)
                             await self.try_add_peer(candidate)
 
-            closest = self.routing_table.find_nearest(target_id, K_BUCKET_SIZE)
+            closest = self.routing_table.find_nearest(target_id)
             all_queried = {p.node_id for p in closest}.issubset(queried_ids | {self.own_peer.node_id})
             if all_queried and not in_flight:
                 break
@@ -643,7 +661,10 @@ class KademliaServer:
     async def set(self, key: str, value: Value):
         target_id = hash_key_to_node_id(key)
         closest = await self.find_node(target_id)
-        self.data_store[key] = StoredValue(value, is_original_publisher=True)
+        self.data_store[key] = StoredValue(
+            value, is_original_publisher=True,
+            expires_at=time.time() + self.key_expiry_seconds,
+        )
         check_tasks = [
             self._send_query(p, {"type": "check_store", "key": key, "size": len(value)})
             for p in closest
@@ -657,10 +678,18 @@ class KademliaServer:
         await asyncio.gather(*store_tasks)
 
     def _store_remote_value(self, key: str, value: Value):
-        self.data_store[key] = StoredValue(value, is_original_publisher=False)
+        existing = self.data_store.get(key)
+        keep_publisher = existing is not None and existing.is_original_publisher and not existing.is_expired()
+        self.data_store[key] = StoredValue(
+            value, is_original_publisher=keep_publisher,
+            expires_at=time.time() + self.key_expiry_seconds,
+        )
 
     def _store_cached_value(self, key: str, value: Value, target_id: str):
-        ttl = compute_cache_ttl(self.own_peer.node_id, target_id)
+        ttl = compute_cache_ttl(
+            self.own_peer.node_id, target_id,
+            self.key_expiry_seconds, self.min_cache_ttl_seconds,
+        )
         expires_at = time.time() + ttl
         self.data_store[key] = StoredValue(value, is_original_publisher=False, expires_at=expires_at)
 
@@ -676,10 +705,10 @@ class KademliaServer:
         query["id"] = query_id
         query["sender"] = self.own_peer.to_dict()
         future = asyncio.get_running_loop().create_future()
-        self.pending_queries[query_id] = future
+        self.pending_queries[query_id] = (future, (peer.ip, peer.port))
         try:
             self.protocol.transport.sendto(self.encode(query), (peer.ip, peer.port))
-            return await asyncio.wait_for(future, timeout=QUERY_TIMEOUT_SECONDS)
+            return await asyncio.wait_for(future, timeout=self.query_timeout)
         except asyncio.TimeoutError:
             self.routing_table.remove_peer(peer.node_id)
             return None
@@ -688,33 +717,53 @@ class KademliaServer:
 
     async def _periodic_bucket_refresh(self):
         while True:
-            await asyncio.sleep(BUCKET_REFRESH_INTERVAL)
+            await asyncio.sleep(self.bucket_refresh_interval)
             for bucket in self.routing_table.stale_buckets():
                 random_id = self._random_id_for_prefix(bucket.prefix)
                 await self.find_node(random_id)
 
     async def _periodic_republish(self):
         while True:
-            await asyncio.sleep(NON_PUBLISHER_RESTORE_INTERVAL)
+            await asyncio.sleep(self.non_publisher_restore_interval)
             for key, entry in list(self.data_store.items()):
-                if entry.is_expired() or not entry.needs_republish():
+                interval = (
+                    self.original_publisher_republish_interval
+                    if entry.is_original_publisher
+                    else self.non_publisher_restore_interval
+                )
+                if entry.is_expired() or not entry.needs_republish(interval):
                     continue
                 if entry.is_original_publisher:
                     await self.set(key, entry.value)
                 else:
                     closest = await self.find_node(hash_key_to_node_id(key))
-                    store_tasks = [self._send_query(p, {"type": "set", "key": key, "value": entry.value}) for p in closest]
+                    check_tasks = [
+                        self._send_query(p, {"type": "check_store", "key": key, "size": len(entry.value)})
+                        for p in closest
+                    ]
+                    check_results = await asyncio.gather(*check_tasks)
+                    store_tasks = [
+                        self._send_query(p, {"type": "set", "key": key, "value": entry.value})
+                        for p, res in zip(closest, check_results)
+                        if res is None or not res.get("has_key", False)
+                    ]
                     await asyncio.gather(*store_tasks)
                 entry.mark_republished()
 
     async def _periodic_expiry(self):
         while True:
-            await asyncio.sleep(BUCKET_REFRESH_INTERVAL)
+            await asyncio.sleep(self.bucket_refresh_interval)
             self.data_store = {k: v for k, v in self.data_store.items() if not v.is_expired()}
 
-    def deliver_response(self, query_id: str, msg: dict):
-        future = self.pending_queries.get(query_id)
-        if future and not future.done():
+    def deliver_response(self, query_id: str, msg: dict, addr: Optional[Tuple[str, int]] = None):
+        entry = self.pending_queries.get(query_id)
+        if not entry:
+            return
+        future, expected_addr = entry
+        if self.verify_response_source and expected_addr is not None and addr is not None and tuple(addr) != expected_addr:
+            logger.debug(f"[kad] dropping response {query_id} from unexpected source {addr}, expected {expected_addr}")
+            return
+        if not future.done():
             future.set_result(msg)
 
     def stop(self):
