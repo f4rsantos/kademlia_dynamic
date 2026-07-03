@@ -101,12 +101,12 @@ Canonical references: the Kademlia paper (Maymounkov & Mazières, 2002) and BEP 
 | Feature                         | This Implementation                | Canonical Kademlia / BEP 5          |
 | ------------------------------- | ---------------------------------- | ----------------------------------- |
 | **Language**                    | Python                             | (Language-agnostic spec)            |
-| **Async Model**                 | asyncio                            | Blocking (implementation-dependent) |
+| **Async Model**                 | asyncio                            | Not specified (implementation-dependent) |
 | **Serialization**               | JSON (default) or Bencode          | Bencode (bencoding)                 |
-| **Value TTL**                   | Dynamic (distance-based)           | Fixed intervals                     |
-| **Original Publisher Tracking** | Yes                                | Not specified                       |
-| **Cached Value TTL**            | Inversely proportional to distance | Fixed short TTL                     |
-| **RPC Protocol**                | JSON over UDP                      | Bencoded dict over UDP              |
+| **Value TTL**                   | Dynamic (distance-based)           | Paper: distance-based; BEP 5: not specified |
+| **Original Publisher Tracking** | Yes                                | Paper: 24h republish rule; BEP 5: no |
+| **Cached Value TTL**            | Inversely proportional to distance | Paper: same idea (§2.5); BEP 5: fixed short TTL |
+| **RPC Protocol**                | JSON or bencoded dict over UDP     | Bencoded dict over UDP              |
 | **Socket Binding**              | User-specified IP                  | Auto-detect                         |
 
 ### Behavioral Notes

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kademlia-dynamic"
-version = "1.1.0"
+version = "1.1.1"
 description = "Lightweight, async-first Kademlia DHT, with dynamic distance-based cache TTL and switchable JSON/Bencode wire serialization"
 readme = "README.md"
 requires-python = ">=3.8"
